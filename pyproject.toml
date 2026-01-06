@@ -1,0 +1,17 @@
+[tool.ruff]
+# 줄 길이 제한 (가독성 고려, 보통 88 또는 100)
+line-length = 100
+# 제외할 디렉토리
+exclude = ["venv", ".git", "__pycache__"]
+
+[tool.ruff.lint]
+# E: pycodestyle errors
+# F: Pyflakes
+# I: isort (import 정렬)
+# B: flake8-bugbear (잠재적 버그 방지)
+select = ["E", "F", "I", "B"]
+ignore = []
+
+[tool.ruff.format]
+# 문자열 따옴표 스타일 (double recommended)
+quote-style = "double"
