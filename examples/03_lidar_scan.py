@@ -1,3 +1,8 @@
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import matplotlib.pyplot as plt
 import numpy as np
 import gtsam
@@ -9,83 +14,59 @@ from src.sensors.lidar import LidarSensor
 def generate_random_landmarks(count=100, area_size=100):
     landmarks = {}
     for i in range(count):
-        # 차량 주변에 넓게 분포
         x = np.random.uniform(-area_size, area_size)
         y = np.random.uniform(-area_size, area_size)
-        z = np.random.uniform(0, 3)  # 높이는 0~3m
+        z = np.random.uniform(0, 3)
         landmarks[i] = gtsam.Point3(x, y, z)
     return landmarks
 
 
 def main():
-    # 1. 설정
     dt = 0.1
     sim_duration = 5.0
 
     vehicle = GroundVehicle()
-
-    # LiDAR 생성
     lidar = LidarSensor(max_range=20.0, range_noise=0.1)
-
-    # 랜드마크 생성
     landmarks = generate_random_landmarks(count=300, area_size=50)
-
-    # 2. 시뮬레이션 Loop
-    print("LiDAR Simulation Start...")
 
     velocity_x = 5.0
     yaw_rate = 0.5
 
+    print("Running LiDAR Simulation...")
     steps = int(sim_duration / dt)
     for _ in range(steps):
         vehicle.update(dt, velocity_x, yaw_rate)
 
-    # 마지막 시점에서의 스캔 수행
     scan_points, lidar_pose = lidar.measure(vehicle.current_pose, landmarks)
 
-    # --- 시각화 ---
     plt.figure(figsize=(10, 10))
 
-    # 1. 전체 랜드마크 (회색 점)
-    # [수정] .x(), .y() 대신 [0], [1] 인덱스 사용
+    # 전체 랜드마크 (인덱싱 사용)
     lx = [p[0] for p in landmarks.values()]
     ly = [p[1] for p in landmarks.values()]
     plt.scatter(lx, ly, c="lightgray", marker=".", label="All Landmarks")
 
-    # 2. LiDAR에 감지된 포인트
     detected_x = []
     detected_y = []
-
     T_wl = lidar_pose
 
     for lp in scan_points:
-        # Local to World: T_wl * point_local
-        # 결과값 wp는 numpy array입니다.
-        wp = T_wl.transformFrom(lp)
-
-        # [수정] 배열 인덱스로 접근
+        wp = T_wl.transformFrom(lp)  # wp is numpy array
         detected_x.append(wp[0])
         detected_y.append(wp[1])
 
     plt.scatter(detected_x, detected_y, c="red", s=20, marker="x", label="LiDAR Detected")
 
-    # 3. 차량 및 LiDAR 범위 표시
-    # Pose3 객체는 여전히 .x(), .y() 메서드를 가질 수 있지만,
-    # 만약 에러가 난다면 vehicle.current_pose.translation()[0] 등을 써야 합니다.
-    # 우선 Pose3는 클래스 기능을 유지하는 경우가 많으므로 그대로 둡니다.
     veh_x = vehicle.current_pose.x()
     veh_y = vehicle.current_pose.y()
     plt.plot(veh_x, veh_y, "bo", markersize=10, label="Vehicle")
 
-    # 감지 범위 원 그리기
     circle = plt.Circle(
         (veh_x, veh_y), lidar.max_range, color="blue", fill=False, linestyle="--", label="Max Range"
     )
     plt.gca().add_patch(circle)
 
     plt.title(f"LiDAR Simulation (Range: {lidar.max_range}m)")
-    plt.xlabel("X (m)")
-    plt.ylabel("Y (m)")
     plt.axis("equal")
     plt.legend()
     plt.grid(True)
