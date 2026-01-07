@@ -3,93 +3,95 @@ import numpy as np
 import gtsam
 
 from src.dynamics.ground import GroundVehicle
-from src.sensors.lidar import LidarSensor
-
-
-def generate_random_landmarks(count=100, area_size=100):
-    landmarks = {}
-    for i in range(count):
-        # 차량 주변에 넓게 분포
-        x = np.random.uniform(-area_size, area_size)
-        y = np.random.uniform(-area_size, area_size)
-        z = np.random.uniform(0, 3)  # 높이는 0~3m
-        landmarks[i] = gtsam.Point3(x, y, z)
-    return landmarks
+from src.sensors.camera import CameraSensor
+from src.calibration.hand_eye import HandEyeCalibrator
 
 
 def main():
+    print("--- IMU(Body)-Camera Hand-Eye Calibration Simulation ---")
+
     # 1. 설정
     dt = 0.1
-    sim_duration = 5.0
+    sim_duration = 20.0
 
     vehicle = GroundVehicle()
+    # 카메라 센서 (Body 기준 위치: x=2.0, z=1.0)
+    # 실제로는 우리가 sensors/camera.py에서 정의한 body_to_camera 값을 찾아내야 함
+    cam_sensor = CameraSensor()
+    true_T_bc = cam_sensor.body_to_camera
 
-    # LiDAR 생성
-    lidar = LidarSensor(max_range=20.0, range_noise=0.1)
+    print(f"True Extrinsics (Body -> Camera):")
+    print(true_T_bc)
 
-    # 랜드마크 생성
-    landmarks = generate_random_landmarks(count=300, area_size=50)
-
-    # 2. 시뮬레이션 Loop
-    print("LiDAR Simulation Start...")
-
+    # 2. 데이터 수집 (궤적 생성)
+    # Hand-Eye Calibration은 충분한 회전이 있어야 잘 됨 (S자 주행)
     velocity_x = 5.0
-    yaw_rate = 0.5
 
+    body_poses = []  # T_w_b (from GPS/IMU Integration)
+    camera_poses = []  # T_w_c (from Visual Odometry / SLAM)
+
+    print("Simulating Trajectory (S-Curve)...")
     steps = int(sim_duration / dt)
-    for _ in range(steps):
+    for i in range(steps):
+        # S자 주행: Yaw Rate를 사인파로 변경
+        yaw_rate = 0.5 * np.sin(i * dt * 0.5)
+
         vehicle.update(dt, velocity_x, yaw_rate)
 
-    # 마지막 시점에서의 스캔 수행
-    scan_points, lidar_pose = lidar.measure(vehicle.current_pose, landmarks)
+        # 현재 Body Pose (Ground Truth) -> 실제론 IMU/GPS로 추정된 값
+        T_wb = vehicle.current_pose
 
-    # --- 시각화 ---
-    plt.figure(figsize=(10, 10))
+        # 현재 Camera Pose (Ground Truth) -> 실제론 Visual Odometry로 추정된 값
+        # T_wc = T_wb * T_bc
+        T_wc = T_wb.compose(true_T_bc)
 
-    # 1. 전체 랜드마크 (회색 점)
-    # [수정] .x(), .y() 대신 [0], [1] 인덱스 사용
-    lx = [p[0] for p in landmarks.values()]
-    ly = [p[1] for p in landmarks.values()]
-    plt.scatter(lx, ly, c="lightgray", marker=".", label="All Landmarks")
+        # 노이즈 추가 (Visual Odometry가 GPS보다 보통 부정확하므로 노이즈 섞음)
+        # 위치 10cm, 회전 0.05rad 정도 흔들림
+        noise = gtsam.Pose3(
+            gtsam.Rot3.Ypr(np.random.normal(0, 0.01), 0, 0),
+            gtsam.Point3(
+                np.random.normal(0, 0.05), np.random.normal(0, 0.05), np.random.normal(0, 0.05)
+            ),
+        )
+        T_wc_noisy = T_wc.compose(noise)
 
-    # 2. LiDAR에 감지된 포인트
-    detected_x = []
-    detected_y = []
+        body_poses.append(T_wb)
+        camera_poses.append(T_wc_noisy)
 
-    T_wl = lidar_pose
+    print(f"Collected {len(body_poses)} pose pairs.")
 
-    for lp in scan_points:
-        # Local to World: T_wl * point_local
-        # 결과값 wp는 numpy array입니다.
-        wp = T_wl.transformFrom(lp)
+    # 3. 초기값 설정 (Perturbation)
+    # 정답에서 위치 0.5m, 회전 0.2rad 정도 틀어지게 만듦 (꽤 큰 오차)
+    perturbation = gtsam.Pose3(gtsam.Rot3.Ypr(0.2, 0.1, -0.1), gtsam.Point3(0.5, -0.3, 0.2))
+    initial_guess = true_T_bc.compose(perturbation)
 
-        # [수정] 배열 인덱스로 접근
-        detected_x.append(wp[0])
-        detected_y.append(wp[1])
+    print("-" * 30)
+    print("Initial Guess (Perturbed):")
+    print(initial_guess)
 
-    plt.scatter(detected_x, detected_y, c="red", s=20, marker="x", label="LiDAR Detected")
+    # 4. Calibration 실행
+    calibrator = HandEyeCalibrator()
+    optimized_T_bc = calibrator.run(body_poses, camera_poses, initial_guess)
 
-    # 3. 차량 및 LiDAR 범위 표시
-    # Pose3 객체는 여전히 .x(), .y() 메서드를 가질 수 있지만,
-    # 만약 에러가 난다면 vehicle.current_pose.translation()[0] 등을 써야 합니다.
-    # 우선 Pose3는 클래스 기능을 유지하는 경우가 많으므로 그대로 둡니다.
-    veh_x = vehicle.current_pose.x()
-    veh_y = vehicle.current_pose.y()
-    plt.plot(veh_x, veh_y, "bo", markersize=10, label="Vehicle")
+    # 5. 결과 비교
+    print("-" * 30)
+    print("Optimized Result:")
+    print(optimized_T_bc)
 
-    # 감지 범위 원 그리기
-    circle = plt.Circle(
-        (veh_x, veh_y), lidar.max_range, color="blue", fill=False, linestyle="--", label="Max Range"
-    )
-    plt.gca().add_patch(circle)
+    # 오차 계산
+    error_pose = true_T_bc.between(optimized_T_bc)
+    trans_err = np.linalg.norm(error_pose.translation())
+    rot_err = np.linalg.norm(error_pose.rotation().xyz())
 
-    plt.title(f"LiDAR Simulation (Range: {lidar.max_range}m)")
-    plt.xlabel("X (m)")
-    plt.ylabel("Y (m)")
-    plt.axis("equal")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    print("-" * 30)
+    print(f"Estimation Error:")
+    print(f"  Translation: {trans_err:.6f} m")
+    print(f"  Rotation   : {rot_err:.6f} rad")
+
+    if trans_err < 0.1 and rot_err < 0.1:
+        print(">> Calibration SUCCESS!")
+    else:
+        print(">> Calibration WARNING!")
 
 
 if __name__ == "__main__":

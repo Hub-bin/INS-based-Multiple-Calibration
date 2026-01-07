@@ -30,11 +30,12 @@ class CameraSensor:
         self.calibration = gtsam.Cal3_S2(fx, fy, 0.0, u0, v0)
 
         # 카메라와 차량(Body) 사이의 변환 행렬 (Extrinsics)
-        # 예: 차량 중심에서 앞쪽으로 2m, 위로 1m, 카메라는 앞을 정면으로 바라봄(X-forward)
-        # GTSAM의 카메라는 보통 Z-forward (OpenCV 스타일)이므로 좌표계 변환 필요
-        # Body(X-forward, Z-up) -> Camera(Z-forward, Y-down)
-        # R_bc = [ [0, -1, 0], [0, 0, -1], [1, 0, 0] ]
-        R_bc = gtsam.Rot3(np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]]))
+        # Body(X-fwd, Y-left, Z-up) -> Camera(Z-fwd, X-right, Y-down)
+        # R_bc columns are Camera axes expressed in Body frame
+        # Col 0 (Cam X / Right) = -Body Y (0, -1, 0)
+        # Col 1 (Cam Y / Down)  = -Body Z (0, 0, -1)
+        # Col 2 (Cam Z / Fwd)   =  Body X (1, 0, 0)
+        R_bc = gtsam.Rot3(np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]]))
         t_bc = gtsam.Point3(2.0, 0.0, 1.0)  # 차량 중심에서 전방 2m, 상방 1m 설치
         self.body_to_camera = gtsam.Pose3(R_bc, t_bc)
 
