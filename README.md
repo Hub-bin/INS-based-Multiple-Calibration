@@ -49,3 +49,57 @@ INS-based-Multiple-Calibration/
 ├── pyproject.toml              # Ruff 설정 파일
 └── README.md
 ```
+
+---
+
+## 🛠️ Installation
+
+본 프로젝트는 Python 3.8 이상 환경을 권장합니다.
+
+1.  **Repository Clone**
+    ```bash
+    git clone [https://github.com/Hub-bin/INS-based-Multiple-Calibration.git](https://github.com/Hub-bin/INS-based-Multiple-Calibration.git)
+    cd INS-based-Multiple-Calibration
+    ```
+
+2.  **Dependencies Installation**
+    필수 라이브러리(`gtsam`, `numpy`, `scipy`, `matplotlib`)를 설치합니다.
+    ```bash
+    pip install gtsam numpy scipy matplotlib
+    ```
+
+3.  **Dev Tools (Optional)**
+    코드 포맷팅을 위해 `ruff`를 사용합니다.
+    ```bash
+    pip install ruff
+    ```
+
+---
+
+## 💻 Usage & Examples
+
+### 1. Hand-Eye Calibration (IMU-Camera)
+S자 주행 궤적을 시뮬레이션하고, IMU(Body)와 Camera 간의 상대 위치를 추정합니다.
+```bash
+python main.py
+```
+* **Output**: True Extrinsics vs Optimized Result 비교, Translation/Rotation 오차 출력.
+
+### 2. LiDAR-Camera Extrinsic Calibration
+LiDAR의 3D 포인트와 Camera의 2D 이미지 좌표 매칭을 통해 두 센서 간의 변환 행렬을 찾습니다.
+```bash
+python examples/05_lidar_camera_calibration.py
+```
+
+### 3. Online IMU Bias Estimation
+iSAM2를 사용하여 실시간으로 IMU의 가속도/자이로 바이어스가 수렴하는 과정을 시각화합니다.
+```bash
+python examples/04_online_calibration.py
+```
+
+### 4. Sensor Simulation Visualization
+각 센서의 동작을 시각적으로 확인할 수 있습니다.
+```bash
+python examples/03_lidar_scan.py   # LiDAR FOV 및 Point Cloud 시각화
+python examples/02_camera_view.py  # Camera FOV 및 랜드마크 투영 시각화
+```
