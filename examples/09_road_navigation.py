@@ -12,10 +12,11 @@ import folium
 from src.utils.road_generator import RoadTrajectoryGenerator
 from src.sensors.imu import ImuSensor
 from src.calibration.offline import OfflineCalibrator
+from src.calibration.sysid_corrector import SysIdCalibrator  # [New] SysID 추가
 
 
-def run_dead_reckoning(start_pose, start_vel, measurements, bias, dt):
-    """Dead Reckoning으로 궤적 복원"""
+def run_dead_reckoning(start_pose, start_vel, measurements, bias, dt, correction_params=None):
+    """Dead Reckoning으로 궤적 복원 (SysID 보정 적용)"""
     pim_params = gtsam.PreintegrationParams.MakeSharedU(9.81)
     pim = gtsam.PreintegratedImuMeasurements(pim_params, bias)
 
@@ -23,8 +24,23 @@ def run_dead_reckoning(start_pose, start_vel, measurements, bias, dt):
     curr_pose = start_pose
     curr_vel = start_vel
 
-    for acc, gyr in measurements:
+    # SysID 파라미터 추출
+    if correction_params:
+        acc_T_inv = correction_params.get("acc_T_inv", np.eye(3))
+        acc_b = correction_params.get("acc_b", np.zeros(3))
+        gyr_T_inv = correction_params.get("gyr_T_inv", np.eye(3))
+        gyr_b = correction_params.get("gyr_b", np.zeros(3))
+
+    for raw_acc, raw_gyr in measurements:
+        if correction_params:
+            # SysID Correction: T_inv * (Raw - b)
+            acc = acc_T_inv @ (raw_acc - acc_b)
+            gyr = gyr_T_inv @ (raw_gyr - gyr_b)
+        else:
+            acc, gyr = raw_acc, raw_gyr
+
         pim.integrateMeasurement(acc, gyr, dt)
+
         nav_state = gtsam.NavState(curr_pose, curr_vel)
         next_state = pim.predict(nav_state, bias)
 
@@ -37,113 +53,140 @@ def run_dead_reckoning(start_pose, start_vel, measurements, bias, dt):
 
 
 def main():
-    print("=== Real Road Trajectory Simulation ===")
+    print("=== Real Road Trajectory Simulation (Bias + Scale + Misalignment) ===")
 
     # 1. 도로망 궤적 생성
     # 부산 시청 근처
     road_gen = RoadTrajectoryGenerator(location_point=(35.1796, 129.0756), dist=1500)
 
     print("Finding a route...")
-    # 임의의 경로 생성
     x_pts, y_pts, route_ids = road_gen.generate_path()
 
-    # 보간하여 운동학적 데이터 생성 (속도 15m/s = 약 54km/h)
+    # 약 20m/s (72km/h)로 설정하여 다이나믹한 움직임 유도
     dt = 0.1
-    traj_data = road_gen.interpolate_trajectory(x_pts, y_pts, target_speed=15.0, dt=dt)
+    traj_data = road_gen.interpolate_trajectory(x_pts, y_pts, target_speed=20.0, dt=dt)
     print(f"Trajectory generated: {len(traj_data)} steps ({len(traj_data) * dt:.1f} sec)")
 
-    # 2. IMU 시뮬레이션
-    true_acc_bias = np.array([0.1, -0.1, 0.05])
-    true_gyr_bias = np.array([0.01, 0.01, -0.01])
+    # 2. IMU 시뮬레이션 (복합 오차 주입)
+    true_acc_bias = np.array([0.2, -0.2, 0.1])
+    true_gyr_bias = np.array([0.01, 0.02, -0.01])
+
+    # Scale Factor (대각선) & Misalignment (비대각선)
+    true_T_acc = np.array([[1.05, 0.02, 0.01], [0.02, 1.03, 0.01], [0.01, 0.01, 0.98]])
+    true_T_gyr = np.eye(3)
 
     imu = ImuSensor(
-        accel_noise=0.05, gyro_noise=0.005, accel_bias=true_acc_bias, gyro_bias=true_gyr_bias
+        accel_noise=0.02,
+        gyro_noise=0.005,
+        accel_bias=true_acc_bias,
+        gyro_bias=true_gyr_bias,
+        accel_error_matrix=true_T_acc,
+        gyro_error_matrix=true_T_gyr,
     )
 
     imu_measurements = []
+    gt_measurements = []
     gt_poses = []
+
+    # 초기 속도 (World Frame)
+    if len(traj_data) > 0:
+        R0 = traj_data[0]["pose"].rotation().matrix()
+        start_vel_world = gtsam.Point3(R0 @ traj_data[0]["vel_body"])
+    else:
+        print("Error: No trajectory data generated.")
+        return
 
     for data in traj_data:
         pose = data["pose"]
-        acc_body = data["accel_body"]
+        acc_kinematic_body = data["accel_body"]
         omega_body = data["omega_body"]
 
-        meas = imu.measure(pose, acc_body, omega_body)
+        # 1. 센서 측정 (Raw)
+        meas = imu.measure(pose, acc_kinematic_body, omega_body)
         imu_measurements.append(meas)
         gt_poses.append(pose)
 
-    # 3. Calibration & Navigation
-    print("Running Calibration & Navigation...")
+        # 2. SysID용 정답 데이터 생성 (Specific Force)
+        rot_wb = pose.rotation()
+        g_world = gtsam.Point3(0, 0, -9.81)
+        g_body_gtsam = rot_wb.unrotate(g_world)
 
-    # 초기 Bias 0 가정
-    init_bias = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
-    calibrator = OfflineCalibrator(init_bias=init_bias)
+        # [수정] numpy array 반환 대응
+        if isinstance(g_body_gtsam, np.ndarray):
+            g_body = g_body_gtsam
+        else:
+            g_body = np.array([g_body_gtsam.x(), g_body_gtsam.y(), g_body_gtsam.z()])
 
-    # 최적화 수행
-    est_bias = calibrator.run(gt_poses, imu_measurements, dt)
-    print(f"Estimated Bias: {est_bias}")
+        sf_body = acc_kinematic_body - g_body
+        gt_measurements.append((sf_body, omega_body))
 
-    # 항법 수행 (Dead Reckoning)
-    start_vel = gtsam.Point3(*traj_data[0]["vel_body"])
+    # 3. Calibration (SysID)
+    print("Running SysID Calibration...")
+    sysid = SysIdCalibrator()
+    correction_params = sysid.run(gt_measurements, imu_measurements)
 
-    # 정확히는 World Velocity가 필요
-    R0 = gt_poses[0].rotation().matrix()
-    start_vel_world = gtsam.Point3(R0 @ traj_data[0]["vel_body"])
+    print("Estimated Accel Bias:", correction_params["acc_b"])
+    print("True Accel Bias:     ", true_acc_bias)
 
-    est_poses = run_dead_reckoning(gt_poses[0], start_vel_world, imu_measurements, est_bias, dt)
+    # 4. 항법 수행 (Dead Reckoning)
+    zero_bias = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
 
-    # 4. 시각화 (Folium Map)
+    est_poses = run_dead_reckoning(
+        gt_poses[0],
+        start_vel_world,
+        imu_measurements,
+        zero_bias,
+        dt,
+        correction_params=correction_params,
+    )
+
+    # 5. 시각화 (Folium Map)
     print("Generating Map Visualization...")
-
-    # 도로망 원본 경로 (Lat/Lon)
     route_latlon = road_gen.get_latlon_route(route_ids)
 
-    # 중심점 (부산 시청)
-    center_lat, center_lon = 35.1796, 129.0756
-    m_per_deg_lat = 111000.0
-    m_per_deg_lon = 111000.0 * np.cos(np.radians(center_lat))
-
-    # [수정] 시작점 Lat/Lon 가져오기 (G_proj['lat'] 대신 G['y'] 사용)
+    # 시작점 Lat/Lon
     start_lat = road_gen.G.nodes[route_ids[0]]["y"]
     start_lon = road_gen.G.nodes[route_ids[0]]["x"]
 
+    # 좌표 변환 계수
+    m_per_deg_lat = 111000.0
+    m_per_deg_lon = 111000.0 * np.cos(np.radians(start_lat))
+
     est_path_latlon = []
     for p in est_poses:
-        # Local meters -> Delta Lat/Lon
         d_lat = p.y() / m_per_deg_lat
         d_lon = p.x() / m_per_deg_lon
         est_path_latlon.append([start_lat + d_lat, start_lon + d_lon])
 
-    # 지도 생성
     m = folium.Map(location=[start_lat, start_lon], zoom_start=15)
 
-    # A. 원본 도로 경로 (빨간색)
+    # 원본 도로 (Red)
     folium.PolyLine(
-        locations=route_latlon, color="red", weight=5, opacity=0.5, tooltip="Road Network Path"
+        locations=route_latlon, color="red", weight=5, opacity=0.5, tooltip="Road Network"
     ).add_to(m)
 
-    # B. 추정된 궤적 (파란색)
+    # 추정 궤적 (Blue)
     folium.PolyLine(
-        locations=est_path_latlon,
-        color="blue",
-        weight=3,
-        opacity=0.8,
-        tooltip="Estimated Trajectory",
+        locations=est_path_latlon, color="blue", weight=3, opacity=0.8, tooltip="Estimated (SysID)"
     ).add_to(m)
 
-    # 저장
-    map_file = "road_navigation_result.html"
+    map_file = "road_navigation_result_advanced.html"
     m.save(map_file)
     print(f"Map saved to '{map_file}'.")
 
-    # 추가: XY Plot
-    plt.figure()
-    plt.plot([p.x() for p in gt_poses], [p.y() for p in gt_poses], "k--", label="GT (Interpolated)")
-    plt.plot([p.x() for p in est_poses], [p.y() for p in est_poses], "b-", label="Estimated")
-    plt.plot(x_pts, y_pts, "ro", label="Road Nodes")  # 원본 노드
-    plt.legend()
-    plt.title("Local Frame Trajectory")
+    # XY Plot
+    gt_x = [p.x() for p in gt_poses]
+    gt_y = [p.y() for p in gt_poses]
+    est_x = [p.x() for p in est_poses]
+    est_y = [p.y() for p in est_poses]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(gt_x, gt_y, "k--", label="GT")
+    plt.plot(est_x, est_y, "b-", label="Estimated (SysID)")
+    plt.title("Road Navigation with Scale/Misalignment Errors")
     plt.axis("equal")
+    plt.legend()
+    plt.grid(True)
     plt.show()
 
 
