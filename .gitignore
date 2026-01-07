@@ -8,6 +8,8 @@ venv/
 # IDE
 .vscode/
 .idea/
+cache/
+output/
 
 # OS
 .DS_Store
