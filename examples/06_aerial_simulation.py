@@ -1,8 +1,13 @@
+import sys
+import os
+
+# 부모 디렉토리를 경로에 추가
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D
 
-# 새로 만든 AerialVehicle import
 from src.dynamics.aerial import AerialVehicle
 from src.sensors.imu import ImuSensor
 
@@ -16,46 +21,29 @@ def main():
     # 1. 드론 생성
     drone = AerialVehicle()
 
-    # IMU 장착 (노이즈 포함)
+    # IMU 장착
     imu = ImuSensor(accel_noise=0.01, gyro_noise=0.001)
 
     # 2. 비행 시나리오: 나선형 상승 (Spiral Up)
-    # 속도: 전방(x)으로 가면서 + 위로(z) 상승
     vel_x = 5.0
     vel_z = 1.0
-
-    # 회전: 제자리에서 계속 돔 (Yaw Turn) + 약간의 Roll/Pitch 흔들림
     yaw_rate = 0.5
 
     print("Simulating flight...")
 
     steps = int(sim_duration / dt)
-
-    # 궤적 저장용
     timestamps = []
     poses = []
 
     for t_step in range(steps):
         t = t_step * dt
 
-        # Body Velocity: [Forward, Left, Up]
         velocity_body = np.array([vel_x, 0.0, vel_z])
-
-        # Body Omega: [Roll, Pitch, Yaw]
-        omega_body = np.array(
-            [
-                0.1 * np.sin(t),  # Roll oscillation
-                0.1 * np.cos(t),  # Pitch oscillation
-                yaw_rate,  # Constant Yaw turn
-            ]
-        )
+        omega_body = np.array([0.1 * np.sin(t), 0.1 * np.cos(t), yaw_rate])
 
         drone.update(dt, velocity_body, omega_body)
 
-        # [수정됨] ImuSensor.measure 인터페이스에 맞게 불필요한 인자 제거
-        # 가속도/각속도 측정 (중력 포함됨)
-        # 등속 운동(가속도=0)이라고 가정하고 [0,0,0]을 입력으로 줌
-        # 실제로는 중력 가속도가 내부에서 계산되어 더해짐
+        # IMU 측정 (등속 운동 가정, 중력은 내부에서 계산됨)
         meas = imu.measure(
             drone.current_pose, true_accel_body=np.array([0, 0, 0]), true_omega_body=omega_body
         )
@@ -75,7 +63,6 @@ def main():
 
     ax.plot(xs, ys, zs, label="Drone Trajectory", linewidth=2, color="purple")
 
-    # 시작점/끝점 표시
     ax.scatter([xs[0]], [ys[0]], [zs[0]], color="green", marker="o", s=50, label="Start")
     ax.scatter([xs[-1]], [ys[-1]], [zs[-1]], color="red", marker="x", s=50, label="End")
 
