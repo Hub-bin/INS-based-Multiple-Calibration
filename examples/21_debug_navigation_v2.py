@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -11,14 +12,17 @@ import torch
 import copy
 
 from src.utils.road_generator import RoadTrajectoryGenerator
-from src.dynamics.ground import GroundVehicle
 from src.sensors.imu import ImuSensor
 from src.calibration.sysid_corrector import SysIdCalibrator
 from src.calibration.rl_agent import RLAgent
 
+# --- 0. Output Directory ---
+OUTPUT_DIR = "output"
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
 
-# --- Helper: 교통 상황 생성 ---
-# (이전과 동일)
+
+# --- 1. Helper: Traffic & Road Dynamics ---
 def apply_traffic_profile(trajectory, dt, total_duration_min=10):
     total_steps = int(total_duration_min * 60 / dt)
     n_points = len(trajectory)
@@ -26,425 +30,408 @@ def apply_traffic_profile(trajectory, dt, total_duration_min=10):
     curr_idx = 0
     curr_vel = 0.0
 
-    print(f"Generating Traffic Profile for {total_duration_min} mins ({total_steps} steps)...")
+    print(f"Generating 3D Traffic with Road Dynamics ({total_duration_min} mins)...")
     for i in range(total_steps):
         t = i * dt
+        # 1. 속도 프로파일 (Stop & Go for Hysteresis)
         traffic_phase = int(t / 60.0) % 5
-        if traffic_phase == 0 or traffic_phase == 2:  # Stop & Go
-            target_vel = 5.0 + 5.0 * np.sin(t * 0.5)
+        if traffic_phase == 0 or traffic_phase == 2:
+            target_vel = 15.0 + 10.0 * np.sin(2.0 * np.pi * t / 15.0)
             if target_vel < 0:
                 target_vel = 0
         elif traffic_phase == 4:
             target_vel = 0.0
         else:
-            target_vel = 15.0 + np.random.normal(0, 0.5)
+            target_vel = 25.0 + np.random.normal(0, 0.5)
 
-        acc = target_vel - curr_vel
-        acc = np.clip(acc, -3.0, 2.0)
-        curr_vel += acc * dt
+        acc_lin = target_vel - curr_vel
+        acc_lin = np.clip(acc_lin, -4.0, 3.5)
+        curr_vel += acc_lin * dt
         if curr_vel < 0:
             curr_vel = 0
 
+        # 위치 업데이트
         step_dist = curr_vel * dt
-        curr_idx += step_dist / (20.0 * 0.1)
-        if curr_idx >= n_points - 1:
-            curr_idx = n_points - 1
-            curr_vel = 0.0
+        curr_idx += step_dist / (2.0)
+        idx_int = int(min(curr_idx, n_points - 1))
 
-        idx_int = int(curr_idx)
-        alpha = curr_idx - idx_int
-        p1 = trajectory[idx_int]["pose"]
-        p2 = trajectory[min(idx_int + 1, n_points - 1)]["pose"]
+        # 2. 자세(Attitude) 생성
+        base_pose = trajectory[idx_int]["pose"]
+        base_rot = base_pose.rotation()
 
-        t1 = p1.translation()
-        t2 = p2.translation()
-        if not isinstance(t1, np.ndarray):
-            t1 = np.array([t1.x(), t1.y(), t1.z()])
-        if not isinstance(t2, np.ndarray):
-            t2 = np.array([t2.x(), t2.y(), t2.z()])
-        t_interp = t1 * (1 - alpha) + t2 * alpha
+        # Road Dynamics: Roll(뱅크), Pitch(경사)
+        sim_roll = 0.1 * np.sin(2.0 * np.pi * t / 17.0)
+        sim_pitch = 0.08 * np.sin(2.0 * np.pi * t / 29.0)
 
-        r1 = p1.rotation()
-        r2 = p2.rotation()
-        r_interp = r1.slerp(alpha, r2)
-        pose_interp = gtsam.Pose3(r_interp, t_interp)
-        acc_body = np.array([acc, 0.0, 0.0])
-        orig_omega = trajectory[idx_int]["omega_body"]
-        scaled_omega = orig_omega * (curr_vel / 20.0)
+        delta_rot = gtsam.Rot3.Ypr(0, sim_pitch, sim_roll)
+        new_rot = base_rot.compose(delta_rot)
+        new_pose = gtsam.Pose3(new_rot, base_pose.translation())
+
+        # 3. 3축 가속도/각속도 생성
+        acc_x = acc_lin
+        acc_y = 0.8 * np.sin(2.0 * np.pi * t / 7.0)
+        acc_z = 0.5 * np.sin(2.0 * np.pi * t / 3.0)
+
+        omega = trajectory[idx_int]["omega_body"] * (curr_vel / 20.0)
+        omega += np.array(
+            [
+                0.1 * np.cos(2 * np.pi * t / 17.0),
+                0.05 * np.cos(2 * np.pi * t / 29.0),
+                0.02 * np.sin(2 * np.pi * t / 10.0),
+            ]
+        )
 
         new_traj.append(
             {
-                "pose": pose_interp,
-                "accel_body": acc_body,
-                "omega_body": scaled_omega,
+                "pose": new_pose,
+                "accel_body": np.array([acc_x, acc_y, acc_z]),
+                "omega_body": omega,
                 "vel_world": curr_vel,
-                "temp": 20.0 + (40.0 * (i / total_steps)),
+                "temp": 20.0 + (30.0 * (i / total_steps)),
             }
         )
     return new_traj
 
 
-# --- New Plotting Functions ---
-def plot_vector_params(log, true_params):
-    """Figure 2: Bias, Temp, Hysteresis 시각화"""
-    times = np.array(log["time"]) / 60.0  # min
-
-    est_b = np.array(log["bias"])
-    est_tl = np.array(log["temp_lin"])
-    est_tn = np.array(log["temp_non"])
-    est_h = np.array(log["hyst"])
-
-    fig, axes = plt.subplots(4, 3, figsize=(15, 16))
-    fig.suptitle("Figure 2: Vector Parameters Convergence (Bias, Temp, Hysteresis)", fontsize=14)
-
-    rows_data = [
-        (est_b, "bias", "Bias ($m/s^2$)"),
-        (est_tl, "temp_lin", "Temp Lin ($/^\circ C$)"),
-        (est_tn, "temp_non", "Temp Non ($/^\circ C^2$)"),
-        (est_h, "hyst", "Hysteresis ($m/s^2$)"),
-    ]
-
-    axes_names = ["X-axis", "Y-axis", "Z-axis"]
-
-    for row_idx, (est_data, true_key, ylabel) in enumerate(rows_data):
-        true_val = true_params[true_key]
-        for col_idx in range(3):
-            ax = axes[row_idx, col_idx]
-            ax.plot(times, est_data[:, col_idx], "b-", label="Est")
-            ax.axhline(true_val[col_idx], color="r", linestyle="--", label="True")
-
-            if col_idx == 0:
-                ax.set_ylabel(ylabel)
-            if row_idx == 0:
-                ax.set_title(axes_names[col_idx])
-            if row_idx == 3:
-                ax.set_xlabel("Time (min)")
-
-            # Hysteresis 그래프 Y축 범위 조정 (잘 보이게)
-            if true_key == "hyst":
-                ax.set_ylim(-0.01, 0.05)  # True 값이 0.02이므로 이 범위로 설정
-
-            ax.grid(True)
-            if row_idx == 0 and col_idx == 2:
-                ax.legend()
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-
-
-def plot_matrix_params(log, true_params):
-    """Figure 3: Scale Factor & Misalignment (T_inv matrix) 시각화"""
+# --- 2. Visualization: All Parameters ---
+def plot_all_calibration_results(log, true_params_acc, true_params_gyr, dt):
     times = np.array(log["time"]) / 60.0
 
-    # T_inv는 (N, 3, 3) 형태의 배열
-    est_T_inv_hist = np.array(log["T_inv"])
-    true_T_inv = true_params["T_inv"]
-
-    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
-    fig.suptitle("Figure 3: Matrix Parameters (Scale & Misalignment - $T^{-1}$)", fontsize=14)
-
-    labels = [
-        ["$T^{-1}_{xx}$ (Scale X)", "$T^{-1}_{xy}$ (Misalign)", "$T^{-1}_{xz}$ (Misalign)"],
-        ["$T^{-1}_{yx}$ (Misalign)", "$T^{-1}_{yy}$ (Scale Y)", "$T^{-1}_{yz}$ (Misalign)"],
-        ["$T^{-1}_{zx}$ (Misalign)", "$T^{-1}_{zy}$ (Misalign)", "$T^{-1}_{zz}$ (Scale Z)"],
+    param_groups = [
+        ("Bias", "bias", "bias"),
+        ("Scale Factor", "scale", "scale"),
+        ("Temp Linear", "temp_lin", "temp_lin"),
+        ("Temp Nonlinear", "temp_non", "temp_non"),
+        ("Hysteresis", "hyst", "hyst"),
     ]
 
-    for r in range(3):
+    # 1. Accelerometer Plots
+    fig_acc, axes_acc = plt.subplots(5, 3, figsize=(15, 15))
+    fig_acc.suptitle("Accelerometer Calibration Parameters", fontsize=16)
+
+    for r, (name, l_key, t_key) in enumerate(param_groups):
+        est_data = np.array(log["acc"][l_key])
+        true_data = true_params_acc[t_key]
+
         for c in range(3):
-            ax = axes[r, c]
-            # 시간대별 r행 c열 요소 추출
-            est_val_series = est_T_inv_hist[:, r, c]
-            true_val = true_T_inv[r, c]
+            ax = axes_acc[r, c]
+            ax.plot(times, est_data[:, c], "b-", label="Est")
 
-            ax.plot(times, est_val_series, "b-", label="Est")
-            ax.axhline(true_val, color="r", linestyle="--", label="True")
-            ax.set_title(labels[r][c])
+            tv = true_data[c] if hasattr(true_data, "__len__") else true_data
+            if name == "Scale Factor" and not hasattr(true_data, "__len__"):
+                tv = 1.0
 
-            # 대각선(Scale)과 비대각선(Misalign)의 Y축 스케일을 다르게 설정
-            if r == c:  # Scale Factor
-                ax.set_ylim(0.99, 1.01)  # 1.0 근처 확대
-            else:  # Misalignment
-                ax.set_ylim(-0.01, 0.01)  # 0.0 근처 확대
+            ax.axhline(tv, color="r", linestyle="--", label="True")
 
-            ax.grid(True)
-            if r == 2:
+            if c == 0:
+                ax.set_ylabel(name)
+            if r == 0:
+                ax.set_title(f"{'XYZ'[c]}-axis")
+            if r == 4:
                 ax.set_xlabel("Time (min)")
+            ax.grid(True)
             if r == 0 and c == 2:
                 ax.legend()
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(f"{OUTPUT_DIR}/accel_params.png")
+
+    # 2. Gyroscope Plots
+    fig_gyr, axes_gyr = plt.subplots(5, 3, figsize=(15, 15))
+    fig_gyr.suptitle("Gyroscope Calibration Parameters", fontsize=16)
+
+    for r, (name, l_key, t_key) in enumerate(param_groups):
+        est_data = np.array(log["gyr"][l_key])
+        true_data = true_params_gyr[t_key]
+
+        for c in range(3):
+            ax = axes_gyr[r, c]
+            ax.plot(times, est_data[:, c], "g-", label="Est")
+
+            tv = true_data[c] if hasattr(true_data, "__len__") else true_data
+            if name == "Scale Factor" and not hasattr(true_data, "__len__"):
+                tv = 1.0
+
+            ax.axhline(tv, color="r", linestyle="--", label="True")
+
+            if c == 0:
+                ax.set_ylabel(name)
+            if r == 0:
+                ax.set_title(f"{'XYZ'[c]}-axis")
+            if r == 4:
+                ax.set_xlabel("Time (min)")
+            ax.grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(f"{OUTPUT_DIR}/gyro_params.png")
 
 
-# --- Navigation Logic ---
-def navigate_trajectory(
-    sim_traj, imu_config, agent, mode="online", fixed_params=None, true_params_debug=None
+# --- 3. Navigation Engine ---
+def navigate(
+    sim_traj, imu_config, mode="online", fixed_params=None, true_p_acc=None, true_p_gyr=None
 ):
-    print(f"\n>>> Running Navigation Mode: {mode.upper()}...")
-
+    print(f"\n>>> Mode: {mode.upper()}")
     imu = ImuSensor(**imu_config)
     sysid = SysIdCalibrator()
-
-    est_poses = [sim_traj[0]["pose"]]
     curr_pose = sim_traj[0]["pose"]
     curr_vel = np.zeros(3)
-    curr_bias = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
+    pim = gtsam.PreintegratedImuMeasurements(
+        gtsam.PreintegrationParams.MakeSharedU(0.0), gtsam.imuBias.ConstantBias()
+    )
 
-    pim_params = gtsam.PreintegrationParams.MakeSharedU(9.81)
-    pim = gtsam.PreintegratedImuMeasurements(pim_params, curr_bias)
-
-    buffer_window = 100
-    history_meas = []
-    history_true = []
-    history_temp = []
-
-    static_counter = 0
-    static_gyr_sum = np.zeros(3)
-
-    curr_params = None
-    if mode == "fixed":
-        curr_params = fixed_params
-
-    # Logging update: store full T_inv matrix
-    param_log = {"time": [], "bias": [], "T_inv": [], "temp_lin": [], "temp_non": [], "hyst": []}
+    poses, h_meas, h_true_acc, h_true_gyr, h_temp = [curr_pose], [], [], [], []
+    param_log = {
+        "time": [],
+        "acc": {"bias": [], "scale": [], "temp_lin": [], "temp_non": [], "hyst": []},
+        "gyr": {"bias": [], "scale": [], "temp_lin": [], "temp_non": [], "hyst": []},
+    }
     dt = 0.1
+    buffer_window = 100
+    curr_p = fixed_params
+    best_p = None
+    min_err = float("inf")
 
-    min_param_error = float("inf")
-    best_params = None
+    prev_sf = np.zeros(3)
+    prev_omega = np.zeros(3)
 
     for i, data in enumerate(sim_traj):
-        true_pose = data["pose"]
-        acc_body = data["accel_body"]
-        omg_body = data["omega_body"]
-        temp = data["temp"]
+        # 1. Measure
+        meas_acc, meas_gyr, _ = imu.measure(
+            data["pose"], data["accel_body"], data["omega_body"], temperature=data["temp"]
+        )
 
-        meas_acc, meas_gyr, _ = imu.measure(true_pose, acc_body, omg_body, temperature=temp)
+        # [수정] Scale Factor 수동 적용 (ImuSensor 미지원 기능 보완)
+        if true_p_acc and true_p_gyr:
+            meas_acc = meas_acc * true_p_acc["scale"]
+            meas_gyr = meas_gyr * true_p_gyr["scale"]
 
-        # ZUPT
-        is_stopped = data["vel_world"] < 0.05
-        if is_stopped:
-            static_counter += 1
-            static_gyr_sum += meas_gyr
+        # 2. ZUPT
+        if data["vel_world"] < 0.05:
             curr_vel = np.zeros(3)
-            if static_counter > 10:
-                avg_gyr = static_gyr_sum / static_counter
-                curr_bias = gtsam.imuBias.ConstantBias(np.zeros(3), avg_gyr)
-                pim.resetIntegrationAndSetBias(curr_bias)
-        else:
-            static_counter = 0
-            static_gyr_sum = np.zeros(3)
 
+        # 3. Online Learning
         if mode == "online":
-            history_meas.append((meas_acc, meas_gyr))
-            rot = true_pose.rotation()
-            g_body_np = rot.unrotate(gtsam.Point3(0, 0, -9.81))
-            if not isinstance(g_body_np, np.ndarray):
-                g_body_np = np.array([g_body_np.x(), g_body_np.y(), g_body_np.z()])
-            sf_true = acc_body - g_body_np
-            history_true.append((sf_true, omg_body))
-            history_temp.append(temp)
+            h_meas.append((meas_acc, meas_gyr))
 
-            # Update Step
+            g_body_vec = data["pose"].rotation().unrotate(gtsam.Point3(0, 0, -9.81))
+            if hasattr(g_body_vec, "x"):
+                g_vec = np.array([g_body_vec.x(), g_body_vec.y(), g_body_vec.z()])
+            else:
+                g_vec = g_body_vec
+
+            sf_true = data["accel_body"] - g_vec
+            h_true_acc.append(sf_true)
+            h_true_gyr.append(data["omega_body"])
+            h_temp.append(data["temp"])
+
             if i > 600 and i % buffer_window == 0:
-                temps_arr = np.array(history_temp)
-                accs_arr = np.array([m[0] for m in history_meas])
-                state = [
-                    (np.mean(temps_arr) - 20) / 40.0,
-                    np.std(temps_arr) * 10.0,
-                    np.std(accs_arr),
-                    np.mean(np.abs(np.diff(accs_arr, axis=0))) * 10.0,
-                ]
+                mask = np.ones(21)
 
-                action, _ = agent.get_action(state, deterministic=True)
-                decision = action > 0.0
+                # [수정] 데이터를 올바르게 패킹하여 전달 (튜플 리스트)
+                packed_true = list(zip(h_true_acc, h_true_gyr))
+                res = sysid.run(packed_true, h_meas, h_temp, acc_mask=mask, gyr_mask=mask)
 
-                acc_mask = np.zeros(21)
-                if decision[0]:
-                    acc_mask[9:12] = 1.0
-                if decision[1]:
-                    acc_mask[12:18] = 1.0
-                if decision[2]:
-                    acc_mask[18:21] = 1.0
+                if res is not None:
+                    # Bias 오차만으로 최적 파라미터 판단
+                    acc_b_err = np.linalg.norm(res["acc_b"] - true_p_acc["bias"])
+                    gyr_b_err = np.linalg.norm(res["gyr_b"] - true_p_gyr["bias"])
+                    total_err = acc_b_err + gyr_b_err
 
-                temp_res = sysid.run(history_true, history_meas, history_temp, acc_mask=acc_mask)
+                    if total_err < min_err:
+                        min_err = total_err
+                        best_p = copy.deepcopy(res)
 
-                est_b = temp_res["acc_b"]
-                true_b = true_params_debug["bias"]
-                bias_err = np.linalg.norm(est_b - true_b)
+                    if i % 600 == 0:
+                        print(
+                            f"  [Time {i * dt / 60:.1f}m] AccBiasErr: {acc_b_err:.4f} | GyrBiasErr: {gyr_b_err:.4f}"
+                        )
+                    curr_p = res
+                else:
+                    if i % 600 == 0:
+                        print(f"  [Time {i * dt / 60:.1f}m] SysID Optimization Failed")
 
-                if bias_err < min_param_error:
-                    min_param_error = bias_err
-                    best_params = copy.deepcopy(temp_res)
-
-                if i % 600 == 0:
-                    print(
-                        f"  [Time {i * dt / 60:.1f}m] RL:{decision.astype(int)} | BiasErr: {bias_err:.4f}"
-                    )
-
-                curr_params = temp_res
-
-        # Logging
+        # 4. Logging
         if i % buffer_window == 0:
             param_log["time"].append(i * dt)
-            if curr_params:
-                param_log["bias"].append(curr_params["acc_b"])
-                param_log["T_inv"].append(curr_params["acc_T_inv"])  # Store full matrix
-                param_log["temp_lin"].append(curr_params["acc_k1"])
-                param_log["temp_non"].append(curr_params["acc_k2"])
-                param_log["hyst"].append(curr_params["acc_h"])
-            else:
-                param_log["bias"].append(np.zeros(3))
-                param_log["T_inv"].append(np.eye(3))  # Default identity
-                param_log["temp_lin"].append(np.zeros(3))
-                param_log["temp_non"].append(np.zeros(3))
-                param_log["hyst"].append(np.zeros(3))
+            p = (
+                curr_p
+                if curr_p
+                else {
+                    "acc_b": np.zeros(3),
+                    "acc_T_inv": np.eye(3),
+                    "acc_k1": np.zeros(3),
+                    "acc_k2": np.zeros(3),
+                    "acc_h": np.zeros(3),
+                    "gyr_b": np.zeros(3),
+                    "gyr_T_inv": np.eye(3),
+                    "gyr_k1": np.zeros(3),
+                    "gyr_k2": np.zeros(3),
+                    "gyr_h": np.zeros(3),
+                }
+            )
+            # Acc
+            param_log["acc"]["bias"].append(p["acc_b"])
+            param_log["acc"]["scale"].append(np.diag(p["acc_T_inv"]))
+            param_log["acc"]["temp_lin"].append(p["acc_k1"])
+            param_log["acc"]["temp_non"].append(p["acc_k2"])
+            param_log["acc"]["hyst"].append(p["acc_h"])
+            # Gyr
+            param_log["gyr"]["bias"].append(p["gyr_b"])
+            param_log["gyr"]["scale"].append(np.diag(p["gyr_T_inv"]))
+            param_log["gyr"]["temp_lin"].append(p["gyr_k1"])
+            param_log["gyr"]["temp_non"].append(p["gyr_k2"])
+            param_log["gyr"]["hyst"].append(p["gyr_h"])
 
-        # Correction
-        if mode == "raw" or curr_params is None:
-            corr_acc = meas_acc
+        # 5. Correction
+        g_body_vec = data["pose"].rotation().unrotate(gtsam.Point3(0, 0, -9.81))
+        if hasattr(g_body_vec, "x"):
+            g_vec = np.array([g_body_vec.x(), g_body_vec.y(), g_body_vec.z()])
         else:
-            p = curr_params
-            dt_temp = temp - 20.0
-            err_bias = p["acc_b"]
-            err_lin = p["acc_k1"] * dt_temp
-            err_non = p["acc_k2"] * (dt_temp**2)
-            hyst_sign = np.sign(meas_acc)
-            err_hyst = p["acc_h"] * hyst_sign
-            term = meas_acc - err_bias - err_lin - err_non - err_hyst
-            corr_acc = p["acc_T_inv"] @ term
+            g_vec = g_body_vec
 
-        pim.integrateMeasurement(corr_acc, meas_gyr, dt)
-        nav_state = gtsam.NavState(curr_pose, curr_vel)
-        next_state = pim.predict(nav_state, curr_bias)
-        curr_pose = next_state.pose()
-        curr_vel = next_state.velocity()
+        if mode == "raw" or curr_p is None:
+            corr_acc = meas_acc + g_vec
+            corr_gyr = meas_gyr
+        else:
+            p = curr_p
+            dt_t = data["temp"] - 20.0
+
+            # --- Accel Correction ---
+            sf_curr = data["accel_body"] - g_vec
+            if i == 0:
+                acc_diff = np.zeros(3)
+            else:
+                acc_diff = sf_curr - prev_sf
+            prev_sf = sf_curr
+            acc_h_sign = np.tanh(acc_diff * 10.0)
+
+            acc_err = (
+                p["acc_b"] + p["acc_k1"] * dt_t + p["acc_k2"] * (dt_t**2) + p["acc_h"] * acc_h_sign
+            )
+            corr_acc = p["acc_T_inv"] @ (meas_acc - acc_err)
+
+            # --- Gyro Correction ---
+            omega_curr = data["omega_body"]
+            if i == 0:
+                gyr_diff = np.zeros(3)
+            else:
+                gyr_diff = omega_curr - prev_omega
+            prev_omega = omega_curr
+            gyr_h_sign = np.tanh(gyr_diff * 10.0)
+
+            gyr_err = (
+                p["gyr_b"] + p["gyr_k1"] * dt_t + p["gyr_k2"] * (dt_t**2) + p["gyr_h"] * gyr_h_sign
+            )
+            corr_gyr = p["gyr_T_inv"] @ (meas_gyr - gyr_err)
+
+        # 6. Integration
+        pim.integrateMeasurement(corr_acc, corr_gyr, dt)
+        nav = gtsam.NavState(curr_pose, curr_vel)
+        next_s = pim.predict(nav, gtsam.imuBias.ConstantBias())
+        curr_pose, curr_vel = next_s.pose(), next_s.velocity()
         pim.resetIntegration()
-        est_poses.append(curr_pose)
+        poses.append(curr_pose)
 
-    final_ret_params = best_params if mode == "online" else curr_params
-    if mode == "online" and best_params is None:
-        final_ret_params = curr_params
-
-    return est_poses, param_log, final_ret_params
+    return poses, param_log, (best_p if mode == "online" else curr_p)
 
 
 def run_improved_navigation():
-    print("=== Improved Navigation: Final Diagnostics V2 ===")
-
     start_loc = (35.1796, 129.0756)
     dt = 0.1
-
     road_gen = RoadTrajectoryGenerator(location_point=start_loc, dist=8000)
-    x_pts, y_pts, route_ids = road_gen.generate_path()
-    base_traj = road_gen.interpolate_trajectory(x_pts, y_pts, target_speed=20.0, dt=dt)
-    sim_traj = apply_traffic_profile(base_traj, dt, total_duration_min=10)
+    x, y, _ = road_gen.generate_path()
+    sim_traj = apply_traffic_profile(road_gen.interpolate_trajectory(x, y, 20.0, dt), dt)
 
-    # [중요] True Parameter 설정 (미정렬 포함)
-    true_T_inv = np.array(
-        [
-            [1.001, 0.0002, 0.0001],  # Slight scale error & misalignment
-            [0.0001, 1.0015, 0.0002],
-            [0.0001, 0.0001, 1.002],
-        ]
-    )
-
-    true_params = {
-        "bias": np.array([0.05, -0.02, 0.01]),
-        "T_inv": true_T_inv,
+    # [설정] True Parameters with Scale Error
+    true_acc = {
+        "bias": np.array([0.1, -0.05, 0.02]),
+        "scale": np.array([1.01, 0.99, 1.005]),
         "temp_lin": np.array([0.01, 0.01, 0.01]),
         "temp_non": np.array([0.0001, 0.0001, 0.0001]),
-        "hyst": np.array([0.02, 0.02, 0.02]),
+        "hyst": np.array([0.005, 0.003, 0.002]),
+    }
+    true_gyr = {
+        "bias": np.array([0.01, -0.01, 0.005]),
+        "scale": np.array([0.995, 1.005, 1.0]),
+        "temp_lin": np.array([0.0001, 0.0001, 0.0001]),
+        "temp_non": np.array([1e-5, 1e-5, 1e-5]),
+        "hyst": np.array([0.0005, 0.0005, 0.0005]),
     }
 
-    # ImuSensor는 벡터 형태의 scale/misalignment를 받지 않으므로,
-    # 시뮬레이션 생성 시에는 이상적인 ImuSensor를 쓰고,
-    # 데이터 주입 시에 수동으로 오차를 더하는 방식이 맞으나,
-    # 현재 ImuSensor 구현상 T_inv를 직접 주입할 수 없으므로
-    # 여기서는 Bias/Temp/Hyst만 ImuSensor로 넣고, Scale/Misalignment는 이상적(Identity)이라고 가정하고 테스트합니다.
-    # (Scale/Misalignment 추정 기능 자체가 동작하는지 확인하는 목적)
-
-    # 만약 Scale/Misalignment가 포함된 데이터를 만들려면 ImuSensor 클래스 수정이 필요합니다.
-    # 현재는 ImuSensor가 제공하는 오차만 주입합니다.
-    imu_config = {
-        "accel_bias": true_params["bias"],
+    imu_cfg = {
+        "accel_bias": true_acc["bias"],
+        "accel_hysteresis": true_acc["hyst"],
         "accel_temp_coeff_linear": 0.01,
         "accel_temp_coeff_nonlinear": 0.0001,
-        "accel_hysteresis": 0.02,
         "accel_noise": 0.0001,
-        "gyro_noise": 0.00001,
-        "gyro_bias": [0.0001, 0.0001, 0.0001],
+        "gyro_bias": true_gyr["bias"],
+        "gyro_noise": 1e-5,
     }
-    # 따라서 True T_inv는 Identity로 설정하여 플롯 검증
-    true_params["T_inv"] = np.eye(3)
 
-    agent = RLAgent(input_dim=4, action_dim=3)
-    with torch.no_grad():
-        agent.policy.fc1.weight.fill_(0.0)
-        agent.policy.fc1.bias.fill_(0.0)
-        agent.policy.fc1.weight[0, 1] = 5.0
-        agent.policy.fc1.weight[1, 3] = 5.0
-        agent.policy.fc2.weight.fill_(0.0)
-        agent.policy.fc2.bias.fill_(0.0)
-        agent.policy.fc2.weight[0, 0] = 1.0
-        agent.policy.fc2.weight[1, 1] = 1.0
-        agent.policy.mu_head.weight.fill_(0.0)
-        agent.policy.mu_head.bias.data = torch.tensor([2.0, -2.0, -2.0])
-        agent.policy.mu_head.weight[1, 0] = 5.0
-        agent.policy.mu_head.weight[2, 1] = 5.0
+    # Execute
+    p_raw, _, _ = navigate(sim_traj, imu_cfg, "raw")
+    p_on, log, b_p = navigate(sim_traj, imu_cfg, "online", true_p_acc=true_acc, true_p_gyr=true_gyr)
+    p_val, _, _ = navigate(sim_traj, imu_cfg, "fixed", fixed_params=b_p)
 
-    # Run Modes
-    poses_raw, _, _ = navigate_trajectory(sim_traj, imu_config, agent, mode="raw")
-    poses_online, log_online, best_params = navigate_trajectory(
-        sim_traj, imu_config, agent, mode="online", true_params_debug=true_params
-    )
-    poses_valid, _, _ = navigate_trajectory(
-        sim_traj, imu_config, agent, mode="fixed", fixed_params=best_params
-    )
+    print(f"\n[Final Results - Accelerometer]")
+    if b_p:
+        print(f"  > Bias (Est): {b_p['acc_b']}")
+        print(f"  > Bias (True): {true_acc['bias']}")
+        print(f"  > Hyst (Est): {b_p['acc_h']}")
+        print(f"  > Hyst (True): {true_acc['hyst']}")
+    else:
+        print("  > Calibration Failed")
 
-    # Visualization
-    print("Generating Plots...")
+    plot_all_calibration_results(log, true_acc, true_gyr, dt)
 
-    # Figure 1: Position Error
-    def get_err(poses):
-        est_xy = np.array(
+    # Position Error Plot
+    def get_xyz(p):
+        return np.array(
             [
-                (p.translation()[0], p.translation()[1])
-                if isinstance(p.translation(), np.ndarray)
-                else (p.x(), p.y())
-                for p in poses
+                (pt.x(), pt.y()) if hasattr(pt, "x") else (pt[0], pt[1])
+                for pt in [pp.translation() for pp in p]
             ]
         )
-        gt_xy = np.array(
-            [
-                (p["pose"].translation()[0], p["pose"].translation()[1])
-                if isinstance(p["pose"].translation(), np.ndarray)
-                else (p["pose"].x(), p["pose"].y())
-                for p in sim_traj
-            ]
-        )
-        min_len = min(len(gt_xy), len(est_xy))
-        return np.linalg.norm(gt_xy[:min_len] - est_xy[:min_len], axis=1), min_len
 
-    err_raw, len_raw = get_err(poses_raw)
-    err_online, len_online = get_err(poses_online)
-    err_valid, len_valid = get_err(poses_valid)
-    t_axis = np.arange(len_raw) * dt / 60.0
+    gt_xy = get_xyz([d["pose"] for d in sim_traj])
+    xy_raw, xy_on, xy_val = get_xyz(p_raw), get_xyz(p_on), get_xyz(p_val)
+    min_l = min(len(gt_xy), len(xy_raw), len(xy_val))
+    t_ax = np.arange(min_l) * dt / 60.0
 
     plt.figure(figsize=(10, 5))
-    plt.plot(t_axis, err_raw, "r--", label="Raw Integration")
-    plt.plot(t_axis, err_online, "b-", label="Online Learning")
-    plt.plot(t_axis, err_valid, "m-", label="Validation (Best Params)", linewidth=2)
-    plt.title("Figure 1: Position Error Comparison")
-    plt.xlabel("Time (min)")
-    plt.ylabel("Error (m)")
+    plt.plot(t_ax, np.linalg.norm(gt_xy[:min_l] - xy_raw[:min_l], axis=1), "r--", label="Raw")
+    plt.plot(t_ax, np.linalg.norm(gt_xy[:min_l] - xy_on[:min_l], axis=1), "b-", label="Online")
+    plt.plot(
+        t_ax, np.linalg.norm(gt_xy[:min_l] - xy_val[:min_l], axis=1), "m-", label="Fixed", lw=2
+    )
+    plt.title("Position Error")
     plt.legend()
     plt.grid(True)
+    plt.savefig(f"{OUTPUT_DIR}/pos_error.png")
 
-    # Figure 2: Vector Params (Bias, Temp, Hyst)
-    plot_vector_params(log_online, true_params)
+    # Map
+    m = folium.Map(location=start_loc, zoom_start=14)
 
-    # Figure 3: Matrix Params (Scale, Misalignment)
-    plot_matrix_params(log_online, true_params)
+    def add_trace(plist, color, name):
+        m_deg = 111000.0
+        lon_s = m_deg * np.cos(np.radians(start_loc[0]))
+        coords = []
+        for p in plist:
+            t = p.translation()
+            if hasattr(t, "x"):
+                px, py = t.x(), t.y()
+            else:
+                px, py = t[0], t[1]
+            coords.append([start_loc[0] + py / m_deg, start_loc[1] + px / lon_s])
+        folium.PolyLine(coords[::10], color=color, weight=3, tooltip=name).add_to(m)
 
-    plt.show()  # Show all plots at once
+    add_trace([d["pose"] for d in sim_traj], "green", "GT")
+    add_trace(p_raw, "red", "Raw")
+    add_trace(p_val, "purple", "Proposed")
+    m.save(f"{OUTPUT_DIR}/final_map_complete.html")
+    print(f"Done. Results in '{OUTPUT_DIR}/'")
+
+    plt.show()
 
 
 if __name__ == "__main__":
