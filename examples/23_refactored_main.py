@@ -27,17 +27,16 @@ def run_simulation():
 
     # Simulator
     sim = TrajectorySimulator(road_gen, dt)
+    # 일반 주행 + 3D 거동이 포함된 프로파일 (항법 성능 테스트용)
     traj_data = sim.generate_3d_profile(total_duration_min=10)
 
-    # [수정] 군사용 1-mil급 고성능 INS 스펙 적용
-    # Gyro Bias: 1e-5 rad/s (approx 2 deg/hr) -> Tactical Grade
-    # Accel Bias: 1e-3 m/s^2 (approx 100 ug)
+    # [설정] 1-mil급 고성능 INS 스펙 (Tactical Grade)
     true_acc = {
         "bias": [1.5e-3, -2.0e-3, 5.0e-4],
         "scale": [1.0001, 0.9999, 1.00005],
         "temp_lin": [1e-5] * 3,
         "temp_non": [1e-7] * 3,
-        "hyst": [2e-4, 1e-4, 1e-4],  # 히스테리시스도 매우 작음
+        "hyst": [2e-4, 1e-4, 1e-4],
     }
     true_gyr = {
         "bias": [1e-5, -1.5e-5, 5e-6],
@@ -47,13 +46,13 @@ def run_simulation():
         "hyst": [1e-6] * 3,
     }
 
-    # Sensor Noise도 고성능에 맞춰 대폭 감소
+    # Noise도 대폭 감소
     imu = ImuSensor(
         accel_bias=true_acc["bias"],
         accel_hysteresis=true_acc["hyst"],
-        accel_noise=1e-5,  # Low noise
+        accel_noise=1e-5,
         gyro_bias=true_gyr["bias"],
-        gyro_noise=1e-6,  # Very low noise
+        gyro_noise=1e-6,
     )
 
     sysid = SysIdCalibrator()
@@ -62,13 +61,26 @@ def run_simulation():
     # 2. Run Modes
     results = {}
 
+    # Sliding Window 설정
+    WINDOW_SEC = 60.0
+    WINDOW_STEPS = int(WINDOW_SEC / dt)
+    UPDATE_INTERVAL = int(10.0 / dt)
+
     for mode in ["raw", "online"]:
         print(f"\n>>> Running Mode: {mode}")
-        nav = StrapdownNavigator(traj_data[0]["pose"], gravity=9.81)
+
+        # Initial State
+        init_data = traj_data[0]
+        nav = StrapdownNavigator(init_data["pose"], gravity=9.81)
+        nav.curr_vel = init_data["vel_world"]
 
         # Buffers
         h_meas, h_true_acc, h_true_gyr, h_temp = [], [], [], []
         curr_p = None
+
+        # Warm Start States
+        last_acc_params = None
+        last_gyr_params = None
 
         # Log
         log = {
@@ -91,21 +103,52 @@ def run_simulation():
             meas_gyr = meas_gyr * np.array(true_gyr["scale"])
 
             # ZUPT
-            if data["vel_world"] < 0.05:
+            if data["speed"] < 0.05:
                 nav.zero_velocity_update()
 
-            # B. Online Calibration
+            # B. Online Calibration (Sliding Window + Warm Start)
             if mode == "online":
                 h_meas.append((meas_acc, meas_gyr))
                 h_true_acc.append(data["sf_true"])
                 h_true_gyr.append(data["omega_body"])
                 h_temp.append(data["temp"])
 
-                if i > 600 and i % 100 == 0:
-                    packed_true = list(zip(h_true_acc, h_true_gyr))
-                    res = sysid.run(packed_true, h_meas, h_temp)
+                # Window가 꽉 찼고, 업데이트 주기일 때
+                if i >= WINDOW_STEPS and i % UPDATE_INTERVAL == 0:
+                    # Slicing
+                    meas_win = h_meas[-WINDOW_STEPS:]
+                    acc_win = h_true_acc[-WINDOW_STEPS:]
+                    gyr_win = h_true_gyr[-WINDOW_STEPS:]
+                    temp_win = h_temp[-WINDOW_STEPS:]
+                    packed_true = list(zip(acc_win, gyr_win))
+
+                    # Boundary Values for Hysteresis
+                    prev_t_acc = h_true_acc[-WINDOW_STEPS - 1]
+                    prev_t_gyr = h_true_gyr[-WINDOW_STEPS - 1]
+
+                    mask = np.ones(21)
+                    res = sysid.run(
+                        packed_true,
+                        meas_win,
+                        temp_win,
+                        acc_mask=mask,
+                        gyr_mask=mask,
+                        init_acc_params=last_acc_params,
+                        init_gyr_params=last_gyr_params,  # Warm Start
+                        prev_true_acc=prev_t_acc,
+                        prev_true_gyr=prev_t_gyr,  # Continuity
+                    )
+
                     if res:
                         curr_p = res
+                        # Update Warm Start Guess
+                        last_acc_params = res["acc_params"]
+                        last_gyr_params = res["gyr_params"]
+
+                        # Logging Status (Optional)
+                        if i % 600 == 0:
+                            acc_b_err = np.linalg.norm(res["acc_b"] - true_acc["bias"])
+                            print(f"  [Time {i * dt / 60:.1f}m] Est BiasErr: {acc_b_err:.6f}")
 
             # Logging
             if i % 100 == 0:
@@ -114,16 +157,19 @@ def run_simulation():
                     curr_p
                     if curr_p
                     else {
-                        "acc_b": np.zeros(3),
-                        "acc_h": np.zeros(3),
-                        "acc_k1": np.zeros(3),
-                        "acc_k2": np.zeros(3),
-                        "acc_T_inv": np.eye(3),
-                        "gyr_b": np.zeros(3),
-                        "gyr_h": np.zeros(3),
-                        "gyr_k1": np.zeros(3),
-                        "gyr_k2": np.zeros(3),
-                        "gyr_T_inv": np.eye(3),
+                        k: np.zeros(3) if "inv" not in k else np.eye(3)
+                        for k in [
+                            "acc_b",
+                            "acc_h",
+                            "acc_k1",
+                            "acc_k2",
+                            "acc_T_inv",
+                            "gyr_b",
+                            "gyr_h",
+                            "gyr_k1",
+                            "gyr_k2",
+                            "gyr_T_inv",
+                        ]
                     }
                 )
 
@@ -136,7 +182,6 @@ def run_simulation():
 
             # C. Correction
             if mode == "raw" or curr_p is None:
-                # Raw 모드
                 corr_acc = meas_acc
                 corr_gyr = meas_gyr
             else:

@@ -6,9 +6,13 @@ class SysIdCalibrator:
     def __init__(self, ref_temp=20.0):
         self.ref_temp = ref_temp
 
-    def calibrate_sensor(self, true_data, raw_data, temp_data, active_mask=None, is_accel=True):
+    # [수정] initial_guess와 prev_true 인자 추가
+    def calibrate_sensor(
+        self, true_data, raw_data, temp_data, active_mask=None, initial_guess=None, prev_true=None
+    ):
         full_dim = 21
 
+        # 마스크 처리
         if active_mask is None:
             active_indices = np.arange(full_dim)
         else:
@@ -18,24 +22,32 @@ class SysIdCalibrator:
             active_indices = np.where(np.array(active_mask) > 0.5)[0]
 
         if len(active_indices) == 0:
-            return np.eye(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3)
+            return np.eye(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(full_dim)
 
-        # 초기값: Scale은 1.0, 나머지는 0.0
-        x0_full = np.zeros(full_dim)
-        x0_full[0], x0_full[4], x0_full[8] = 1.0, 1.0, 1.0
-
-        # [수정] Bias 초기값: 가속도계 Z축은 중력(9.81) 근처에서 시작하도록 유도
-        if is_accel:
-            x0_full[11] = 9.81
+        # [핵심] 초기값 설정 (Warm Start)
+        if initial_guess is not None and len(initial_guess) == full_dim:
+            x0_full = np.array(initial_guess, dtype=float)
+        else:
+            # Cold Start
+            x0_full = np.zeros(full_dim)
+            x0_full[0], x0_full[4], x0_full[8] = 1.0, 1.0, 1.0  # Scale 1.0
 
         x0_reduced = x0_full[active_indices]
 
+        # 온도 변수
         delta_t = temp_data - self.ref_temp
-        delta_t_sq = delta_t**2
         dt_vec = delta_t[:, np.newaxis]
-        dt2_vec = delta_t_sq[:, np.newaxis]
+        dt2_vec = (delta_t**2)[:, np.newaxis]
 
-        true_diff = np.diff(true_data, axis=0, prepend=true_data[0:1])
+        # [핵심] 히스테리시스 피처 (이전 데이터 연결)
+        if prev_true is not None:
+            # 윈도우 직전 값과 현재 첫 값의 차이로 시작
+            prepend_val = prev_true.reshape(1, 3)
+            true_diff = np.diff(true_data, axis=0, prepend=prepend_val)
+        else:
+            # 정보 없으면 0으로 가정 (기존 방식)
+            true_diff = np.diff(true_data, axis=0, prepend=true_data[0:1])
+
         hyst_feature = np.tanh(true_diff * 10.0)
 
         def loss_func(x_reduced):
@@ -59,15 +71,13 @@ class SysIdCalibrator:
             diff = raw_data - pred
             return np.sum(diff**2)
 
-        # [수정] Bounds 추가: Scale은 0.5 ~ 1.5, 나머지는 자유
-        # T matrix (0~8), Bias (9~11), ...
+        # Bounds
         bounds = []
         for i in range(full_dim):
-            if i in [0, 4, 8]:  # Diagonals of T (Scale)
+            if i in [0, 4, 8]:
                 bounds.append((0.5, 1.5))
             else:
                 bounds.append((None, None))
-
         bounds_reduced = [bounds[i] for i in active_indices]
 
         # 최적화
@@ -83,23 +93,34 @@ class SysIdCalibrator:
         if result.success:
             x_final[active_indices] = result.x
         else:
-            # 실패 시 경고 출력 후 최선값 사용
-            # print(f"[SysID] Warning: Optimization failed ({result.message})")
             x_final[active_indices] = result.x
 
         opt_T = x_final[:9].reshape(3, 3)
         opt_b = x_final[9:12]
-        # ... (나머지 동일) ...
+        opt_klin = x_final[12:15]
+        opt_knon = x_final[15:18]
+        opt_khyst = x_final[18:21]
 
         try:
             T_inv = np.linalg.inv(opt_T)
         except:
             T_inv = np.eye(3)
 
-        return T_inv, opt_b, x_final[12:15], x_final[15:18], x_final[18:21]
+        # [수정] 다음 Warm Start를 위해 전체 파라미터 벡터(x_final)도 반환
+        return T_inv, opt_b, opt_klin, opt_knon, opt_khyst, x_final
 
+    # [수정] run 인터페이스 확장
     def run(
-        self, true_measurements, raw_measurements, temp_measurements, acc_mask=None, gyr_mask=None
+        self,
+        true_measurements,
+        raw_measurements,
+        temp_measurements,
+        acc_mask=None,
+        gyr_mask=None,
+        init_acc_params=None,
+        init_gyr_params=None,
+        prev_true_acc=None,
+        prev_true_gyr=None,
     ):
         def parse(data):
             if isinstance(data, list):
@@ -110,9 +131,13 @@ class SysIdCalibrator:
         r_acc, r_gyr = parse(raw_measurements)
         temps = np.array(temp_measurements)
 
-        # [수정] is_accel 플래그 전달
-        acc_res = self.calibrate_sensor(t_acc, r_acc, temps, acc_mask, is_accel=True)
-        gyr_res = self.calibrate_sensor(t_gyr, r_gyr, temps, gyr_mask, is_accel=False)
+        # 각각 Warm Start 인자 전달
+        acc_res = self.calibrate_sensor(
+            t_acc, r_acc, temps, acc_mask, initial_guess=init_acc_params, prev_true=prev_true_acc
+        )
+        gyr_res = self.calibrate_sensor(
+            t_gyr, r_gyr, temps, gyr_mask, initial_guess=init_gyr_params, prev_true=prev_true_gyr
+        )
 
         return {
             "acc_T_inv": acc_res[0],
@@ -120,9 +145,11 @@ class SysIdCalibrator:
             "acc_k1": acc_res[2],
             "acc_k2": acc_res[3],
             "acc_h": acc_res[4],
+            "acc_params": acc_res[5],
             "gyr_T_inv": gyr_res[0],
             "gyr_b": gyr_res[1],
             "gyr_k1": gyr_res[2],
             "gyr_k2": gyr_res[3],
             "gyr_h": gyr_res[4],
+            "gyr_params": gyr_res[5],
         }
