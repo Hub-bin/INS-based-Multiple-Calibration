@@ -13,7 +13,7 @@ class CalibrationEnv(gym.Env):
         self.dt = dt
         self.window_size = window_size
 
-        # [수정] Action: Acc Bias(3) + Gyr Bias(3) = 6개 (단순화)
+        # [수정] Action: Acc Bias(3) + Gyr Bias(3) = 6개
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
 
         # Observation: [Acc, Gyr, Temp]
@@ -24,15 +24,7 @@ class CalibrationEnv(gym.Env):
         self.sim = None
         self.traj_data = None
         self.imu = None
-
-        # [핵심] 고정된 물리 법칙 (Fixed Physics)
-        # 이 계수를 AI가 학습해야 함. (랜덤 생성 금지)
-        self.temp_coeffs = {
-            "acc_lin": np.array([0.001, 0.001, 0.001]),  # 1도당 1mg
-            "acc_quad": np.array([0.0, 0.0, 0.0]),
-            "gyr_lin": np.array([0.00001, 0.00001, 0.00001]),
-        }
-
+        self.temp_coeffs = None
         self.current_step = 0
 
     def reset(self, seed=None, options=None):
@@ -40,7 +32,17 @@ class CalibrationEnv(gym.Env):
         self.sim = TrajectorySimulator(self.road_gen, self.dt)
         self.traj_data = self.sim.generate_3d_profile(total_duration_min=3)
 
-        # 기본 센서는 오차 없음 (온도 효과는 step에서 수동 주입)
+        # [핵심] 고정된 물리 법칙 (Fixed Physics for Learnability)
+        # 온도에 따른 바이어스 변화 규칙을 고정
+        self.temp_coeffs = {
+            "acc_lin": np.array([0.001, 0.001, 0.001]),  # 1도당 1mg
+            "acc_quad": np.array([0.0, 0.0, 0.0]),
+            "gyr_lin": np.array([0.00001, 0.00001, 0.00001]),
+        }
+
+        # 기본 센서 오차 없음 (온도 효과만 주입)
+        self.true_params = {"acc_scale": np.ones(3), "gyr_scale": np.ones(3)}
+
         self.imu = ImuSensor(
             accel_bias=np.zeros(3),
             accel_hysteresis=np.zeros(3),
@@ -80,13 +82,10 @@ class CalibrationEnv(gym.Env):
                 data["pose"], data["sf_true"], data["omega_body"], data["temp"]
             )
 
-            # 2. [물리] 온도에 따른 True Bias 주입 (고정 법칙)
+            # 2. [물리] 온도 오차 주입 (고정 법칙)
             dt_temp = data["temp"] - 20.0
-            bias_acc = self.temp_coeffs["acc_lin"] * dt_temp
-            bias_gyr = self.temp_coeffs["gyr_lin"] * dt_temp
-
-            meas_acc += bias_acc
-            meas_gyr += bias_gyr
+            meas_acc += self.temp_coeffs["acc_lin"] * dt_temp
+            meas_gyr += self.temp_coeffs["gyr_lin"] * dt_temp
 
             # 3. [보정] Agent Action 적용
             corr_acc = meas_acc - est_bias["acc_bias"]
@@ -101,7 +100,7 @@ class CalibrationEnv(gym.Env):
         self.current_step += eval_len
         mean_vel_err = total_vel_err / eval_len
 
-        # 보상: 속도 오차가 작을수록 0에 가깝게
+        # 보상: 속도 오차 최소화
         reward = -(mean_vel_err * 10.0)
 
         return self._get_observation(self.current_step), reward, terminated, False, {}
@@ -130,7 +129,7 @@ class CalibrationEnv(gym.Env):
         return np.array(obs_rows, dtype=np.float32)
 
     def _decode_action(self, action):
-        # Action -> Bias Only
+        # Action -> Bias Only (Scale/Hyst 제외)
         return {
             "acc_bias": action[0:3] * 0.05,  # +/- 50mg
             "gyr_bias": action[3:6] * 0.005,  # +/- 0.005 rad/s

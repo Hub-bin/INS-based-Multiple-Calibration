@@ -223,7 +223,7 @@ def run_rl_training():
     # [수정] Action Dim 18 -> 6 (Bias Only)
     agent = PPOAgent(state_dim=(600, 7), action_dim=6)
 
-    MAX_EPISODES = 300  # 300회 정도면 Bias 패턴 파악 가능
+    MAX_EPISODES = 500
 
     for episode in range(MAX_EPISODES):
         state, _ = env.reset()

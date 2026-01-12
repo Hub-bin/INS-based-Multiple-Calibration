@@ -29,7 +29,7 @@ class TrajectorySimulator:
         curr_idx = 0.0
         curr_speed = 0.0
 
-        print(f"[Sim] Generating kinematic consistent profile ({total_duration_min} mins)...")
+        # print(f"[Sim] Generating kinematic consistent profile ({total_duration_min} mins)...")
 
         # --- Phase 1: Generate Pose Trajectory first ---
         for i in range(total_steps + 2):  # Extra points for differentiation

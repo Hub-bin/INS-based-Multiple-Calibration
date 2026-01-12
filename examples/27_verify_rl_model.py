@@ -14,7 +14,6 @@ from src.simulation.profile import TrajectorySimulator
 from src.navigation.strapdown import StrapdownNavigator
 from src.calibration.rl_agent import PPOAgent
 
-# 설정
 MODEL_PATH = "output_high_end/rl_calibrator.pth"
 OUTPUT_DIR = "output_verification"
 if not os.path.exists(OUTPUT_DIR):
@@ -22,25 +21,21 @@ if not os.path.exists(OUTPUT_DIR):
 
 
 def decode_action(action):
-    # [수정] 학습 환경과 동일한 6-Dim Bias Decoding
+    # [수정] 6-Dim Bias Decoding
     return {"acc_bias": action[0:3] * 0.05, "gyr_bias": action[3:6] * 0.005}
 
 
 def normalize_observation(meas_acc, meas_gyr, temp):
-    # [핵심] 학습 환경과 동일한 정규화
-    norm_acc = meas_acc / 9.81
-    norm_gyr = meas_gyr
-    norm_temp = (temp - 20.0) / 30.0
-    return np.concatenate([norm_acc, norm_gyr, [norm_temp]])
+    # [핵심] 학습 환경과 동일한 정규화 (가속도/9.81)
+    return np.concatenate([meas_acc / 9.81, meas_gyr, [(temp - 20.0) / 30.0]])
 
 
 def run_verification():
     print(f"\n>>> Loading RL Model from {MODEL_PATH}...")
     if not os.path.exists(MODEL_PATH):
-        print("Model not found.")
         return
 
-    # [수정] action_dim=6
+    # [수정] Action Dim 6
     agent = PPOAgent(state_dim=(600, 7), action_dim=6)
     try:
         agent.policy.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device("cpu")))
@@ -62,7 +57,7 @@ def run_verification():
         gyro_noise=1e-6,
     )
 
-    # [검증용 온도 계수] 학습 환경과 동일하게 설정 (Fixed Physics)
+    # [검증용 온도 계수] 학습 환경과 동일 (Fixed Physics)
     temp_coeffs = {
         "acc_lin": np.array([0.001, 0.001, 0.001]),
         "acc_quad": np.array([0.0, 0.0, 0.0]),
@@ -98,13 +93,13 @@ def run_verification():
             nav_raw.zero_velocity_update()
             nav_rl.zero_velocity_update()
 
-        # [A] Raw
         nav_raw.integrate(meas_acc, meas_gyr, dt)
         pose_raw = nav_raw.predict()
         pr = pose_raw.translation()
         traj_raw.append([pr.x(), pr.y(), pr.z()] if hasattr(pr, "x") else pr)
 
-        # [B] RL
+        # [RL Navigation]
+        # [핵심] 정규화된 Observation 사용
         obs_row = normalize_observation(meas_acc, meas_gyr, data["temp"])
         obs_buffer.append(obs_row)
 
@@ -136,11 +131,9 @@ def run_verification():
     print(f"  > Mean Error (RL) : {np.mean(err_rl):.4f} m")
 
     plt.figure(figsize=(10, 6))
-    plt.plot(err_raw, "r--", label="Raw (Temp Drift)")
-    plt.plot(err_rl, "b-", label="AI Agent")
-    plt.title("Navigation Error Comparison (Bias Only)")
+    plt.plot(err_raw, "r--", label="Raw")
+    plt.plot(err_rl, "b-", label="RL")
     plt.legend()
-    plt.grid(True)
     plt.savefig(f"{OUTPUT_DIR}/verification_result.png")
 
 

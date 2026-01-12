@@ -30,19 +30,16 @@ class ActorCritic(nn.Module):
         with torch.no_grad():
             flatten_size = self.feature_net(dummy_input).shape[1]
 
-        # Actor
         self.actor_fc = nn.Sequential(nn.Linear(flatten_size, 128), nn.ReLU())
         self.actor_mean = nn.Linear(128, action_dim)
         self.actor_act = nn.Tanh()
 
-        # Critic
         self.critic = nn.Sequential(nn.Linear(flatten_size, 128), nn.ReLU(), nn.Linear(128, 1))
-
         self.log_std = nn.Parameter(torch.zeros(action_dim) - 0.5)
 
-        # [핵심] 초기화 적용
+        # [핵심] 가중치 초기화 적용
         self.apply(init_weights)
-        # Actor 출력을 0 근처로 초기화 -> 학습 초기 오차 폭발 방지
+        # Actor 출력을 0 근처로 초기화 (Near-Zero Action)
         nn.init.uniform_(self.actor_mean.weight, -0.01, 0.01)
         nn.init.constant_(self.actor_mean.bias, 0.0)
 
@@ -89,6 +86,7 @@ class PPOAgent:
             discounted_sum = r + self.gamma * discounted_sum
             returns.insert(0, discounted_sum)
         returns = torch.FloatTensor(returns).to(self.device)
+
         if len(returns) > 1:
             returns = (returns - returns.mean()) / (returns.std() + 1e-5)
 
@@ -98,12 +96,10 @@ class PPOAgent:
             dist = Normal(mean, std)
             log_probs = dist.log_prob(actions).sum(dim=-1)
             entropy = dist.entropy().sum(dim=-1)
-
             ratio = torch.exp(log_probs - old_log_probs)
             advantage = returns - values.detach()
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
-
             loss = (
                 -torch.min(surr1, surr2).mean()
                 + 0.5 * self.mse_loss(values, returns)
